@@ -1,0 +1,6 @@
+kfp==1.8.22
+boto3==1.28.64
+wget==3.2
+torch-model-archiver==0.9.0
+minio==7.1.17
+pytorch-kfp-components==0.1.0

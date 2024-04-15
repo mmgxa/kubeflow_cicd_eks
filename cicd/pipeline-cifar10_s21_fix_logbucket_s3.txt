@@ -1,0 +1,603 @@
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║          KubeFlow Pipelines :  Pytorch Cifar10 Image classification          ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+This notebook shows PyTorch CIFAR10 end-to-end  classification example using    
+Kubeflow Pipelines.                                                             
+
+An example notebook that demonstrates how to:                                   
+
+ • Get different tasks needed for the pipeline                                  
+ • Create a Kubeflow pipeline                                                   
+ • Include Pytorch KFP components to preprocess, train, visualize and deploy the
+   model in the pipeline                                                        
+ • Submit a job for execution                                                   
+ • Query(prediction and explain) the final deployed model                       
+
+
+                         import the necessary packages                          
+
+In [1]:
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ import kfp                                                                   │
+│ import json                                                                  │
+│ import os                                                                    │
+│ from kfp.onprem import use_k8s_secret                                        │
+│ from kfp import components                                                   │
+│ from kfp.components import load_component_from_file, load_component_from_url │
+│ from kfp import dsl                                                          │
+│ from kfp import compiler                                                     │
+│ import kubernetes as k8s                                                     │
+│ import numpy as np                                                           │
+│ import logging                                                               │
+│                                                                              │
+│ kfp.__version__                                                              │
+╰──────────────────────────────────────────────────────────────────────────────╯
+Out[1]:
+'1.8.22'
+
+
+             Update values for the ingress gateway and auth session             
+
+In [2]:
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ INGRESS_GATEWAY='http://istio-ingressgateway.istio-system.svc.cluster.local' │
+│ AUTH="MTY5OTMzMjQ0N3xOd3dBTkZCTVIwOVpRa1pKTTFnMVRVWkVSbGt5V2tkTFZsVk1OVUpFVl │
+│ RJMVJFeFNOVU5QVEROVVNWUkZTVk5FVWpKTFJVbEJUMUU9fK0XyQBgQx0iFk0YEng15cxR_gcCQH │
+│ 1V9fVB2WifwckX"                                                              │
+│ NAMESPACE="kubeflow-user-example-com"                                        │
+│ COOKIE="authservice_session="+AUTH                                           │
+│ EXPERIMENT="Default"                                                         │
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+
+                   Set  the Log bucket and Tensorboard Image                    
+
+In [3]:
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ MINIO_ENDPOINT="s3.amazonaws.com"                                            │
+│ LOG_BUCKET="emlo-s21c"                                                       │
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+
+                    Set the client and create the experiment                    
+
+In [4]:
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ client = kfp.Client(host=INGRESS_GATEWAY+"/pipeline", cookies=COOKIE)        │
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+In [5]:
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ client.create_experiment(EXPERIMENT)                                         │
+│ experiments = client.list_experiments(namespace=NAMESPACE)                   │
+│ my_experiment = experiments.experiments[0]                                   │
+│ my_experiment                                                                │
+╰──────────────────────────────────────────────────────────────────────────────╯
+Out[5]:
+{'created_at': datetime.datetime(2023, 11, 7, 4, 51, 56, tzinfo=tzlocal()),
+ 'description': None,
+ 'id': '9ecc149f-dc43-4cb3-bfa2-16f8b41ca0cd',
+ 'name': 'Default',
+ 'resource_references': [{'key': {'id': 'kubeflow-user-example-com',
+                                  'type': 'NAMESPACE'},
+                          'name': None,
+                          'relationship': 'OWNER'}],
+ 'storage_state': 'STORAGESTATE_AVAILABLE'}
+
+
+                         Set  the Inference parameters                          
+
+In [6]:
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ DEPLOY_NAME="torchserve"                                                     │
+│ MODEL_NAME="cifar10"                                                         │
+│ ISVC_NAME=DEPLOY_NAME+"."+NAMESPACE+"."+"example.com"                        │
+│ INPUT_REQUEST="input.json"                                                   │
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+
+        Load the the components yaml files for setting up the components        
+
+In [7]:
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ prepare_tensorboard_op = load_component_from_file(                           │
+│     "yaml/tensorboard_component.yaml"                                        │
+│     )                                                                        │
+│                                                                              │
+│ prep_op = components.load_component_from_file(                               │
+│     "yaml/preprocess_component.yaml"                                         │
+│     )                                                                        │
+│                                                                              │
+│ train_op = components.load_component_from_file(                              │
+│     "yaml/train_component.yaml"                                              │
+│     )                                                                        │
+│                                                                              │
+│ deploy_op = load_component_from_file(                                        │
+│     "yaml/deploy_component.yaml"                                             │
+│     )                                                                        │
+│                                                                              │
+│ pred_op = load_component_from_file(                                          │
+│     "yaml/prediction_component.yaml"                                         │
+│     )                                                                        │
+│                                                                              │
+│ minio_op = components.load_component_from_file(                              │
+│     "yaml/minio_component.yaml"                                              │
+│     )                                                                        │
+│                                                                              │
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+
+                              Define the pipeline                               
+
+In [8]:
+╭──────────────────────────────────────────────────────────────────────────────╮
+│                                                                              │
+│ @dsl.pipeline(                                                               │
+│     name="Training Cifar10 pipeline", description="Cifar 10 dataset          │
+│ pipeline"                                                                    │
+│ )                                                                            │
+│ def pytorch_cifar10( # pylint: disable=too-many-arguments                    │
+│     minio_endpoint=MINIO_ENDPOINT,                                           │
+│     log_bucket=LOG_BUCKET,                                                   │
+│     log_dir=f"tensorboard/logs/{dsl.RUN_ID_PLACEHOLDER}",                    │
+│     mar_path=f"mar/{dsl.RUN_ID_PLACEHOLDER}/model-store",                    │
+│     config_prop_path=f"mar/{dsl.RUN_ID_PLACEHOLDER}/config",                 │
+│     model_uri=f"s3://{LOG_BUCKET}/mar/{dsl.RUN_ID_PLACEHOLDER}",             │
+│     deploy=DEPLOY_NAME,                                                      │
+│     isvc_name=ISVC_NAME,                                                     │
+│     model=MODEL_NAME,                                                        │
+│     namespace=NAMESPACE,                                                     │
+│     confusion_matrix_log_dir=f"confusion_matrix/{dsl.RUN_ID_PLACEHOLDER}/",  │
+│     checkpoint_dir="checkpoint_dir/cifar10",                                 │
+│     input_req=INPUT_REQUEST,                                                 │
+│     cookie=COOKIE,                                                           │
+│     ingress_gateway=INGRESS_GATEWAY,                                         │
+│ ):                                                                           │
+│     volume_train = dsl.PipelineVolume(volume=k8s.client.V1Volume(            │
+│         name="shm",                                                          │
+│         empty_dir=k8s.client.V1EmptyDirVolumeSource(medium='Memory')))       │
+│                                                                              │
+│     def sleep_op(seconds):                                                   │
+│         """Sleep for a while."""                                             │
+│         return dsl.ContainerOp(                                              │
+│             name="Sleep " + str(seconds) + " seconds",                       │
+│             image="python:alpine3.6",                                        │
+│             command=["sh", "-c"],                                            │
+│             arguments=[                                                      │
+│                 'python -c "import time; time.sleep($0)"',                   │
+│                 str(seconds)                                                 │
+│             ],                                                               │
+│         )                                                                    │
+│                                                                              │
+│     """This method defines the pipeline tasks and operations"""              │
+│     pod_template_spec = json.dumps({                                         │
+│         "spec": {                                                            │
+│             "containers": [{                                                 │
+│                 "env": [                                                     │
+│                     {                                                        │
+│                         "name": "AWS_ACCESS_KEY_ID",                         │
+│                         "valueFrom": {                                       │
+│                             "secretKeyRef": {                                │
+│                                 "name": "mlpipeline-minio-artifact",         │
+│                                 "key": "accesskey",                          │
+│                             }                                                │
+│                         },                                                   │
+│                     },                                                       │
+│                     {                                                        │
+│                         "name": "AWS_SECRET_ACCESS_KEY",                     │
+│                         "valueFrom": {                                       │
+│                             "secretKeyRef": {                                │
+│                                 "name": "mlpipeline-minio-artifact",         │
+│                                 "key": "secretkey",                          │
+│                             }                                                │
+│                         },                                                   │
+│                     },                                                       │
+│                     {                                                        │
+│                         "name": "AWS_REGION",                                │
+│                         "value": "us-west-2"                                 │
+│                     },                                                       │
+│                     {                                                        │
+│                         "name": "S3_ENDPOINT",                               │
+│                         "value": f"{minio_endpoint}",                        │
+│                     },                                                       │
+│                     {                                                        │
+│                         "name": "S3_USE_HTTPS",                              │
+│                         "value": "1"                                         │
+│                     },                                                       │
+│                     {                                                        │
+│                         "name": "S3_VERIFY_SSL",                             │
+│                         "value": "0"                                         │
+│                     },                                                       │
+│                 ]                                                            │
+│             }]                                                               │
+│         }                                                                    │
+│     })                                                                       │
+│                                                                              │
+│     prepare_tb_task = prepare_tensorboard_op(                                │
+│         log_dir_uri=f"s3://{log_bucket}/{log_dir}",                          │
+│         image="public.ecr.aws/pytorch-samples/tboard:latest",                │
+│         pod_template_spec=pod_template_spec,                                 │
+│     ).set_display_name("Visualization")                                      │
+│                                                                              │
+│     prep_task = (                                                            │
+│         prep_op().after(prepare_tb_task                                      │
+│                        ).set_display_name("Preprocess & Transform")          │
+│     )                                                                        │
+│     confusion_matrix_url =                                                   │
+│ f"minio://{log_bucket}/{confusion_matrix_log_dir}"                           │
+│     script_args = f"model_name=model.pth," \                                 │
+│                   f"confusion_matrix_url={confusion_matrix_url}"             │
+│     # For GPU, set number of devices and strategy type                       │
+│     ptl_args = f"max_epochs=1, accelerator=auto"                             │
+│     train_task = (                                                           │
+│         train_op(                                                            │
+│             input_data=prep_task.outputs["output_data"],                     │
+│             script_args=script_args,                                         │
+│             ptl_arguments=ptl_args                                           │
+│         ).add_pvolumes({'/dev/shm': volume_train})                           │
+│         .after(prep_task).set_display_name("Training")                       │
+│         # For allocating resources, uncomment below lines                    │
+│         .set_memory_request('3000M')                                         │
+│         .set_memory_limit('3000M')                                           │
+│         .set_cpu_request('3000m')                                            │
+│         .set_cpu_limit('3000m')                                              │
+│         .set_gpu_limit(1)                                                    │
+│         .add_node_selector_constraint('k8s.amazonaws.com/accelerator','g4dn' │
+│ )                                                                            │
+│     )                                                                        │
+│                                                                              │
+│                                                                              │
+│     (                                                                        │
+│         minio_op(                                                            │
+│             bucket_name=log_bucket,                                          │
+│             folder_name=log_dir,                                             │
+│             input_path=train_task.outputs["tensorboard_root"],               │
+│             filename="",                                                     │
+│             endpoint="s3.amazonaws.com"                                      │
+│         ).after(train_task).set_display_name("Tensorboard Events Pusher")    │
+│     )                                                                        │
+│                                                                              │
+│     (                                                                        │
+│         minio_op(                                                            │
+│             bucket_name=log_bucket,                                          │
+│             folder_name=checkpoint_dir,                                      │
+│             input_path=train_task.outputs["checkpoint_dir"],                 │
+│             filename="",                                                     │
+│             endpoint="s3.amazonaws.com"                                      │
+│         ).after(train_task).set_display_name("checkpoint_dir Pusher")        │
+│     )                                                                        │
+│                                                                              │
+│     minio_mar_upload = (                                                     │
+│         minio_op(                                                            │
+│             bucket_name=log_bucket,                                          │
+│             folder_name=mar_path,                                            │
+│             input_path=train_task.outputs["checkpoint_dir"],                 │
+│             filename="cifar10_test.mar",                                     │
+│             endpoint="s3.amazonaws.com"                                      │
+│         ).after(train_task).set_display_name("Mar Pusher")                   │
+│     )                                                                        │
+│                                                                              │
+│     (                                                                        │
+│         minio_op(                                                            │
+│             bucket_name=log_bucket,                                          │
+│             folder_name=config_prop_path,                                    │
+│             input_path=train_task.outputs["checkpoint_dir"],                 │
+│             filename="config.properties",                                    │
+│             endpoint="s3.amazonaws.com"                                      │
+│         ).after(train_task).set_display_name("Conifg Pusher")                │
+│     )                                                                        │
+│                                                                              │
+│     model_uri = str(model_uri)                                               │
+│     # pylint: disable=unused-variable                                        │
+│     isvc_yaml = """                                                          │
+│     apiVersion: "serving.kserve.io/v1beta1"                                  │
+│     kind: "InferenceService"                                                 │
+│     metadata:                                                                │
+│       name: {}                                                               │
+│       namespace: {}                                                          │
+│     spec:                                                                    │
+│       predictor:                                                             │
+│         volumes:                                                             │
+│         - name: dshm                                                         │
+│           emptyDir:                                                          │
+│             medium: Memory                                                   │
+│             sizeLimit: "1024Mi"                                              │
+│         serviceAccountName: sa                                               │
+│         pytorch:                                                             │
+│           protocolVersion: v2                                                │
+│           volumeMounts:                                                      │
+│           - mountPath: /dev/shm                                              │
+│             name: dshm                                                       │
+│             readOnly: false                                                  │
+│           storageUri: {}                                                     │
+│           resources:                                                         │
+│             requests:                                                        │
+│               cpu: 4                                                         │
+│               memory: 8Gi                                                    │
+│             limits:                                                          │
+│               cpu: 4                                                         │
+│               memory: 8Gi                                                    │
+│     """.format(deploy, namespace, model_uri)                                 │
+│                                                                              │
+│     # For GPU inference use below yaml with gpu count and accelerator        │
+│     gpu_count = "1"                                                          │
+│     accelerator = "g4dn"                                                     │
+│     isvc_gpu_yaml = """# pylint: disable=unused-variable                     │
+│     apiVersion: "serving.kserve.io/v1beta1"                                  │
+│     kind: "InferenceService"                                                 │
+│     metadata:                                                                │
+│       name: {}                                                               │
+│       namespace: {}                                                          │
+│     spec:                                                                    │
+│       predictor:                                                             │
+│         volumes:                                                             │
+│         - name: dshm                                                         │
+│           emptyDir:                                                          │
+│             medium: Memory                                                   │
+│             sizeLimit: "2048Mi"                                              │
+│         serviceAccountName: sa                                               │
+│         pytorch:                                                             │
+│         #   runtimeVersion: 0.9.0-gpu                                        │
+│           protocolVersion: v2                                                │
+│           volumeMounts:                                                      │
+│           - mountPath: /dev/shm                                              │
+│             name: dshm                                                       │
+│             readOnly: false                                                  │
+│           storageUri: {}                                                     │
+│           resources:                                                         │
+│             requests:                                                        │
+│               cpu: 3                                                         │
+│               memory: 6Gi                                                    │
+│             limits:                                                          │
+│               cpu: 3                                                         │
+│               memory: 6Gi                                                    │
+│               nvidia.com/gpu: {}                                             │
+│             nodeSelector:                                                    │
+│               k8s.amazonaws.com/accelerator: g4dn                            │
+│ """.format(deploy, namespace, model_uri, gpu_count, accelerator)             │
+│     # Update inferenceservice_yaml for GPU inference                         │
+│     deploy_task = (                                                          │
+│         deploy_op(action="apply", inferenceservice_yaml=isvc_gpu_yaml        │
+│                   ).after(minio_mar_upload).set_display_name("Deployer"      │
+│                 )                                                            │
+│     )                                                                        │
+│     # Wait here for model to be loaded in torchserve for inference           │
+│     sleep_task = sleep_op(60).after(deploy_task).set_display_name("Sleep")   │
+│     # Make Inference request                                                 │
+│     # pred_task = (                                                          │
+│     #     pred_op(                                                           │
+│     #         host_name=isvc_name,                                           │
+│     #         input_request=input_req,                                       │
+│     #         cookie=cookie,                                                 │
+│     #         url=ingress_gateway,                                           │
+│     #         model=model,                                                   │
+│     #         inference_type="infer",                                        │
+│     #     ).after(sleep_task).set_display_name("Prediction")                 │
+│     # )                                                                      │
+│     # (                                                                      │
+│     #     pred_op(                                                           │
+│     #         host_name=isvc_name,                                           │
+│     #         input_request=input_req,                                       │
+│     #         cookie=cookie,                                                 │
+│     #         url=ingress_gateway,                                           │
+│     #         model=model,                                                   │
+│     #         inference_type="explain",                                      │
+│     #     ).after(pred_task).set_display_name("Explanation")                 │
+│     # )                                                                      │
+│                                                                              │
+│     dsl.get_pipeline_conf().add_op_transformer(                              │
+│         use_k8s_secret(                                                      │
+│             secret_name="mlpipeline-minio-artifact",                         │
+│             k8s_secret_key_to_env={                                          │
+│                 "secretkey": "MINIO_SECRET_KEY",                             │
+│                 "accesskey": "MINIO_ACCESS_KEY",                             │
+│             },                                                               │
+│         )                                                                    │
+│     )                                                                        │
+│                                                                              │
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+
+                             Compile  the pipeline                              
+
+In [9]:
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ compiler.Compiler().compile(pytorch_cifar10, 'pytorch.tar.gz',               │
+│ type_check=True)                                                             │
+╰──────────────────────────────────────────────────────────────────────────────╯
+/opt/conda/lib/python3.10/site-packages/kfp/dsl/_container_op.py:1261: 
+FutureWarning: Please create reusable components instead of constructing 
+ContainerOp instances directly. Reusable components are shareable, portable and 
+have compatibility and support guarantees. Please see the documentation: 
+https://www.kubeflow.org/docs/pipelines/sdk/component-development/#writing-your-
+component-definition-file The components can be created manually (or, in case of
+python, using kfp.components.create_component_from_func or func_to_container_op)
+and then loaded using kfp.components.load_component_from_file, 
+load_component_from_uri or load_component_from_text: 
+https://kubeflow-pipelines.readthedocs.io/en/stable/source/kfp.components.html#k
+fp.components.load_component_from_file
+  warnings.warn(
+
+                              Execute the pipeline                              
+
+In [10]:
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ run = client.run_pipeline(my_experiment.id, 'pytorch-cifar10',               │
+│ 'pytorch.tar.gz')                                                            │
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+
+           Wait for inference service below to go to READY True state           
+
+In [5]:
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ !kubectl get isvc $DEPLOY                                                    │
+╰──────────────────────────────────────────────────────────────────────────────╯
+NAME         URL                                                             
+READY   PREV   LATEST   PREVROLLEDOUTREVISION   LATESTREADYREVISION             
+AGE
+torchserve   http://torchserve.kubeflow-user-example-com.svc.cluster.local   
+True           100                              
+torchserve-predictor-default-00001   8m21s
+
+                        Get  the Inference service name                         
+
+In [7]:
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ INFERENCE_SERVICE_LIST = ! kubectl get isvc {DEPLOY_NAME} -n {NAMESPACE} -o  │
+│ json | python3 -c "import sys, json;                                         │
+│ print(json.load(sys.stdin)['status']['url'])"| tr -d '"' | cut -d "/" -f 3   │
+│ INFERENCE_SERVICE_NAME = INFERENCE_SERVICE_LIST[0]                           │
+│ INFERENCE_SERVICE_NAME                                                       │
+╰──────────────────────────────────────────────────────────────────────────────╯
+Out[7]:
+'Error from server (Forbidden): inferenceservices.serving.kserve.io 
+"{DEPLOY_NAME}" is forbidden: User 
+"system:serviceaccount:kubeflow-user-example-com:default-editor" cannot get 
+resource "inferenceservices" in API group "serving.kserve.io" in the namespace 
+"{NAMESPACE}"'
+
+╔══════════════════════════════════════════════════════════════════════════════╗
+║                             See deployed models                              ║
+╚══════════════════════════════════════════════════════════════════════════════╝
+
+In [8]:
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ !curl \                                                                      │
+│     -H "Host: torchserve.kubeflow-user-example-com.emlo.mmg" \               │
+│     -H "Cookie: $COOKIE" \                                                   │
+│     "http://istio-ingressgateway.istio-system.svc.cluster.local/v2/models"   │
+╰──────────────────────────────────────────────────────────────────────────────╯
+curl: /opt/conda/lib/libcurl.so.4: no version information available (required by
+curl)
+{"models": ["cifar10"]}
+
+ Use the deployed model for prediction request and save the output into a json  
+
+In [9]:
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ !python utils/tobytes.py img/kitten.png                                      │
+╰──────────────────────────────────────────────────────────────────────────────╯
+
+In [10]:
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ !echo "$INGRESS_GATEWAY"                                                     │
+╰──────────────────────────────────────────────────────────────────────────────╯
+http://istio-ingressgateway.istio-system.svc.cluster.local
+In [11]:
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ !curl  \                                                                     │
+│     -H "Host: $INFERENCE_SERVICE_NAME" \                                     │
+│     -H "Cookie: $COOKIE" \                                                   │
+│     "$INGRESS_GATEWAY/v2/models"                                             │
+╰──────────────────────────────────────────────────────────────────────────────╯
+curl: /opt/conda/lib/libcurl.so.4: no version information available (required by
+curl)
+Bad Request
+In [12]:
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ !curl  \                                                                     │
+│     -H "Host: $INFERENCE_SERVICE_NAME" \                                     │
+│     -H "Cookie: $COOKIE" \                                                   │
+│     "http://istio-ingressgateway.istio-system.svc.cluster.local/v2/models"   │
+│                                                                              │
+╰──────────────────────────────────────────────────────────────────────────────╯
+curl: /opt/conda/lib/libcurl.so.4: no version information available (required by
+curl)
+Bad Request
+In [13]:
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ !curl \                                                                      │
+│     -H "Host: torchserve.kubeflow-user-example-com.emlo.mmg" \               │
+│     -H "Cookie: $COOKIE" \                                                   │
+│     "http://istio-ingressgateway.istio-system.svc.cluster.local/v2/models/ci │
+│ far10/infer" \                                                               │
+│     -d @./input.json                                                         │
+╰──────────────────────────────────────────────────────────────────────────────╯
+curl: /opt/conda/lib/libcurl.so.4: no version information available (required by
+curl)
+{"id": "f3b7dff2-6d34-403c-8fad-4e62e1fda4c5", "model_name": "cifar10_test", 
+"model_version": "1", "outputs": [{"name": "predict", "shape": [], "datatype": 
+"BYTES", "data": [{"dog": 0.20926304161548615, "bird": 0.14786572754383087, 
+"cat": 0.14531494677066803, "frog": 0.14122921228408813, "deer": 
+0.11034628748893738}]}]}
+In [72]:
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ !curl \                                                                      │
+│     -H "Host: torchserve.kubeflow-user-example-com.emlo.mmg" \               │
+│     -H "Cookie: $COOKIE" \                                                   │
+│     "http://istio-ingressgateway.istio-system.svc.cluster.local/v2/models/ci │
+│ far10/infer" \                                                               │
+│     -d @./img/kitten.json                                                    │
+╰──────────────────────────────────────────────────────────────────────────────╯
+curl: /opt/conda/lib/libcurl.so.4: no version information available (required by
+curl)
+{"id": "6fa58512-dd7b-4ae9-9d3f-b88f6e77e3e4", "model_name": "cifar10_test", 
+"model_version": "1", "outputs": [{"name": "predict", "shape": [], "datatype": 
+"BYTES", "data": [{"horse": 0.15882010757923126, "car": 0.13612963259220123, 
+"plane": 0.11993498355150223, "bird": 0.10733439773321152, "ship": 
+0.09657326340675354}]}]}
+In [74]:
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ import os                                                                    │
+│ import requests                                                              │
+│                                                                              │
+│ headers = {                                                                  │
+│     'Host': f"{INFERENCE_SERVICE_NAME}",                                     │
+│     'Cookie': f"{COOKIE}",                                                   │
+│     'Content-Type': 'application/x-www-form-urlencoded',                     │
+│ }                                                                            │
+│                                                                              │
+│ URL =                                                                        │
+│ 'http://istio-ingressgateway.istio-system.svc.cluster.local/v2/models/cifar1 │
+│ 0/infer'                                                                     │
+│ with open('./img/kitten.json') as f:                                         │
+│     data = f.read().replace('\n', '').replace('\r', '').encode()             │
+│                                                                              │
+│     for i in range(1000):                                                    │
+│         response = requests.post(                                            │
+│             URL,                                                             │
+│             headers=headers,                                                 │
+│             data=data,                                                       │
+│         )                                                                    │
+│                                                                              │
+│ print(response.text)                                                         │
+╰──────────────────────────────────────────────────────────────────────────────╯
+{"id": "696b26da-56e1-4434-ad7a-7bde60777759", "model_name": "cifar10_test", 
+"model_version": "1", "outputs": [{"name": "predict", "shape": [], "datatype": 
+"BYTES", "data": [{"horse": 0.15882010757923126, "car": 0.13612963259220123, 
+"plane": 0.11993498355150223, "bird": 0.10733439773321152, "ship": 
+0.09657326340675354}]}]}
+In [84]:
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ import requests                                                              │
+│ import json                                                                  │
+│                                                                              │
+│ # URL = 'http://' + f"{INGRESS_GATEWAY}" + '/v2/models/' + f"{MODEL_NAME}" + │
+│ '/infer'                                                                     │
+│ URL =                                                                        │
+│ 'http://istio-ingressgateway.istio-system.svc.cluster.local/v2/models/cifar1 │
+│ 0/infer'                                                                     │
+│                                                                              │
+│ with open('./img/kitten.json') as f:                                         │
+│     payload = f.read().replace('\n', '').replace('\r', '').encode()          │
+│                                                                              │
+│                                                                              │
+│ headers = {                                                                  │
+│     'Host': f"{INFERENCE_SERVICE_NAME}",                                     │
+│     'Cookie': f"{COOKIE}",                                                   │
+│     'Content-Type': 'application/json'                                       │
+│ }                                                                            │
+│                                                                              │
+│ response = requests.request("POST", URL, headers=headers, data=payload)      │
+│                                                                              │
+│ print(response.text)                                                         │
+│                                                                              │
+╰──────────────────────────────────────────────────────────────────────────────╯
+{"id": "de07c894-c8ac-4a43-b313-6a8e177488b8", "model_name": "cifar10_test", 
+"model_version": "1", "outputs": [{"name": "predict", "shape": [], "datatype": 
+"BYTES", "data": [{"plane": 0.276592880487442, "truck": 0.25541818141937256, 
+"car": 0.12587128579616547, "bird": 0.08175255358219147, "horse": 
+0.07523645460605621}]}]}
